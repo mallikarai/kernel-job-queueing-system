@@ -1,0 +1,220 @@
+CSE 506 - HOMEWORK 3
+======================
+-----------------
+PROBLEM STATEMENT
+-----------------
+The objective of this project is to develop an in-kernel queueing system that performs various operations asynchronously and efficiently.
+-----------------------------------------------------
+FEATURES SUPPORTED BY ASYNCHRONOUS KERNEL WORK QUEUES
+-----------------------------------------------------
+The following features are supported by the file system for both root and non-root users: (Add -f to a command when you need to write results to file <job_id>.log
+1. Unlink (Delete) multiple files
+  Command : ./xhw3 -j 10 file1 file2 file3
+2. Rename multiple files
+  Command : ./xhw3 -j 3 infile1 outfile1 infile2 outfile2
+3. Encrypt file
+  Command : ./xhw3 -j 1 -e -p <password> infile outfile
+4. Decrypt file
+  Command : ./xhw3 -j 2 -d -p <password> infile outfile
+4. Get stat information for multiple files
+  Command : ./xhw3 -j 11 file1 file2 file3
+5. List all jobs submitted by the user (or all jobs for root user)
+  Command : ./xhw3 -j 5
+6. Get status of a submitted job
+  Command : ./xhw3 -j 6 -i JOB_ID
+7. Delete a previously submitted job
+  Command : ./xhw3 -j 7 -i JOB_ID
+8. Change priority of a submitted job
+  Command : ./xhw3 -j 8 -P 2 -i JOB_ID
+9. Poll the results of a submitted job
+  Command : ./xhw3 -j 9 -i JOB_ID
+ 
+ 
+---------------------------------
+FILES INCLUDED IN THE SUBMISSION
+---------------------------------
+Within hw3-/hw3-CSE506G02/CSE-506 :
+- Makefile : contains C commands to compile and run the user and kernel programs
+- kernel.config : contains the kernel configuration (~1200 configurations)
+- install_module.h : responsible for loading and unloading the kernel module
+- xhw3.c : user file for submitting a job to the kernel workqueue and retrieve results
+- sys_queue.c : file for managing the initializing the workqueue and relevant data structures, performing submitted jobs, and all additional features
+- sys_queue.h : header file containing the abstract defined data structures and macros
+- socket.c : file for creating socket to enable real-time result polling
+- README: Outlines the design of the file system, steps and necessary information on how to run the modules
+- testdir : test directory containing 10 shell scripts to test the aforementioned features
+ 
+-----------------------------------
+STEPS TO SETUP TEST WORKQUEUE
+-----------------------------------
+Run the following linux commands with root privileges:
+1. cd /usr/src/hw3-CSE506G02/CSE-506/ :
+  - make 
+  - sh install_module.sh
+   If the module has to be tested with enforced delays, use the following commands instead:
+   - make ADD_DELAY=1
+   - sh install_module.sh
+2. run one of the commands listed in the "FEATURES SUPPORTED BY WORKQUEUE" section above
+
+---------
+DESIGN
+---------
+This implementation of the asynchronous workqueue uses the kernel concurrency managed workqueue (cmwq) API for job management between threads.
+The queue handles the following operations corresponding to their respective job numbers as provided by the user:
+  1. ENCRYPT_FILE,
+  2. DECRYPT_FILE,
+  3. RENAME_FILE,
+  4. HASH_FILE,
+  5. LIST_JOBS,
+  6. GET_STATUS,
+  7. DELETE_JOB,
+  8. REORDER_JOB,
+  9. POLL_JOB,
+  10. REMOVE_MULTIPLE_FILES,
+  11. STAT_MULTIPLE_FILES,
+  12. CONCATENATE_FILES
+ 
+The asynchronous workqueue implementation is designed as a loadable module,
+Once the queue is initialized, when a job is submitted from the userspace with its respective arguments (as shown in the features section above), the job is enqueued into the workqueue.
+ 
+1. WORKQUEUE DESIGN
+
+a. Multiple priority queues: 
+- The workqueue API is used to maintain 2 workqueues of high and medium priority and their respective max sizes are 20 and 30.
+
+b. Linked Lists as Queues
+To replicate and maintain the status of all the jobs in the workqueues for ease of polling, a list_of_jobs is implemented as a linked list using the list_head struct in kernel space, with each node representing a job.
+Linked lists were chosen to implement list_of_jobs for memory efficiency since they allocate memory dynamically and support insertion and deletion to and from the list in constant time
+This list_of_jobs has a MAXSIZE of 50.
+ 
+
+2. SUBMITTING JOB TO WORKQUEUE
+- A job is enqueued to the medium or high priority queue depending on the priority of the job set by the user
+- When a job is successfully enqueued into the workqueue its state is marked as PENDING in the list_of_jobs.
+- When the job in the workqueue is allocated a CPU thread, the same is marked as RUNNING in the list_of_jobs.
+- Once the job finishes running, it is marked as FAILED/COMPLETED based on the error code returned by the executing thread.
+- When this queue reaches its max limit and a new job is waiting to be enqueued, the least recent job is purged from the head of this list_of_jobs, provided its status is FAILED or COMPLETED.
+- Each time a job is executed by the workqueue_func method, its corresponding method is invoked by the executing thread and its state is consistently maintained in the list_of_jobs.
+ 
+3. GETTING JOB STATUS & RESULT in USER SPACE
+The user can receive the status of the job in one of the 3 ways mentioned below:
+ 
+a. Using a file:
+   When a job is submitted by the user with the -f flag enabled as shown in the following command, the kernel creates a file corresponding to the job id (<job_id>.log) in the current working directory where it dumps the status and result received from the function call corresponding to the job.
+   command to stat multiple files:
+   ./xhw3 -j 11 file1 file2 file3 -f
+ 
+b. Using socket:
+ 
+   Before a job is submitted, a socket is created along with a thread, which listens on the socket recursively. We submit the job using the __syscall__ and block the main thread until the job is completed/failed.
+   Kernel sends messages on this socket to the user (another end point of the socket) as and when it has updates. This enables real-time updates of the job to the user. When the kernel sends an EMPTY message, the user stops listening on the socket, the socket is closed and the socket thread is destroyed.
+ 
+c. Submitting polling request as a job
+   The implementation facilitates a job type POLL_STATUS (job number 9) to periodically get the current status and result of the job from the list_of_jobs every time there is a change in the status. Once the job completes/fails, the POLL_STATUS job terminates. This feature uses a buffer of type struct jobs, which is populated in the kernel space and copied to the user space, hence enabling near real-time updates.
+   command : ./xhw3 -j 9 -i JOB_ID
+ 
+
+4. LOCKING
+To prevent race conditions and inconsistent state of shared data structures being concurrently accessed by multiple executing job threads, mutex lock has been implemented using struct mutex. We chose mutex over spinlock since spinlocks support limited critical sections in terms of execution time, and our critical sections involve iterating over the entire list_of_jobs, whose length could grow making execution time slow.
+This locking has been implemented in all queue management operations on our shared data structure list_of_jobs such as ENQUEUE_JOB, DELETE_JOB, REORDER_JOB, GET_STATUS.
+ 
+File locking : Several users could submit jobs that could read or write to the same file. VFS takes care of the locking as and when required.
+ 
+
+5. ABSTRACT DATA TYPES 
+We have defined the following data structures to implement our workqueue
+ 
+This struct is at the user level and is used to send relevant arguments to the kernel for job execution
+struct job_args
+{
+   char *input_file, *output_file; // filenames to perform job on
+   unsigned char *key; // optional key needed for encryption/decryption
+   int keylen;
+   int priority, job_nbr, job_id; // Job priority, number(job type essentially) and id(unique for all jobs)
+   void *job_list; // buffer to populate job status
+   char **file_list; // list of files on which job is to be performed
+   int output_to_file; // flag set if result/status has to be written to file
+   char cwd[256]; // current working directory
+   char *data; // buffer to populate job result (when output_to_file is not set)
+   int data_buffer_size; // MAXSIZE of data buffer
+};
+ 
+Struct to represent a single job in the workqueue
+struct work_item {
+   struct job_args *job_args;
+   struct work_struct work;
+   struct list_head list;
+};
+ 
+Struct in the kernel space to represent a job
+struct jobs{
+   int job_id, job_status; 
+   struct list_head list;
+   int priority;
+   uid_t user_id;
+   struct work_struct *work;
+   char *job_result;
+};
+ 
+
+6. QUEUE MANAGEMENT POLICIES
+- Our workqueue follows a First Come First Serve policy (Jobs that are submitted earlier are assigned a work thread earlier)
+- When the queue reaches its MAXSIZE, the earliest submitted job in the queue which has either FAILED/COMPLETED is removed from the queue, and our new job is enqueued at the end of the queue.
+ 
+
+6. ASSUMPTIONS 
+- When the write_to_file option isn’t enabled by the user, the results and status of the job are periodically and autonomously polled via socket. 
+- Additionally, the user may also choose to eplicilty poll its job results through a job POLL_STATUS, which uses a shared buffer between the kernel and the user. 
+This buffer has a MAXSIZE of 256. This was done to ensure judicious use of kernel memory as it is expensive and limited. As a result of this, the stat operation returns limited information from vfs_stat
+- Our list_of_jobs has a MAXSIZE of 50, and jobs submitted when the queue is at its maximum capacity would have to wait for a current running job to either fail or complete
+- n case of multiple file operations, users can provided only a max of 10 files at once (defined as MAXFILES in sysqueue.h). This is again done to preserve precious kernel memory
+- We maintain two workqueues of two different priorities. Ideally, we should be able to assign every job a different priority and adjust (or reorder) our priority queue as and when needed.
+ 
+
+-----------------------------
+ADDITIONAL WORK/EXTRA CREDIT
+-----------------------------
+- We have implemented three different kinds of polling for the user. They can choose to write job results and status to a file, submit a polling job,
+and communicate with the executing thread real-time through a socket. 
+- All of these methods are very different from each other and have different trade-offs over one another. 
+The file option helps us get persistent results as we write to disk, socket helps us get real-time communication between kernel and user and submitting polling as a job enables near real-time communication using modification to the job_struct. 
+ 
+------------
+TESTING
+------------
+The 10 test files, residing in the testdir within CSE506, test the following:
+test01.sh:
+   Submit jobs for encryption and decryption, correctness is also tested by comparing original file with decrypted file
+test02.sh:
+   Submit job to concatenate 2 files, positive and negative cases both tested
+test03.sh:
+   Submit job to rename multiple files, positive and negative cases both tested
+test04.sh:
+   Submit job for deleting multiple files, positive and negative cases both tested
+test05.sh:
+   Submit job to stat multiple files, positive and negative cases both tested
+test06.sh:
+   List jobs: list all jobs in the queue, root user can view all jobs, non root users can only view their own jobs
+test07.sh:
+   Polling (blocking): Submitting an encryption job for a large file and polling response from kernel
+test08.sh:
+   Polling (non blocking): Submitting a job and polling results using getStatus
+test09.sh:
+   Deleting a job
+test10.sh:
+   Reordering a job
+ 
+ 
+-----------
+REFERENCES:
+-----------
+ 
+1.https://www.oreilly.com/library/view/understanding-the-linux/0596005652/ch04s08.html
+2. https://rootfriend.tistory.com/entry/Linux-Kernel-Linked-List-Explained
+3. https://dev.to/jemaloqiu/netlink-communication-between-kernel-and-user-space-2mg1
+4. https://embetronicx.com/tutorials/linux/device-drivers/workqueue-in-linux-kernel/#Using_Global_Workqueue_Global_Worker_Thread
+5. http://gauss.ececs.uc.edu/Courses/e4022/doc/workqueue.html
+6. https://www.kernel.org/doc/html/latest/core-api/workqueue.html#c.queue_work
+7. https://habr.com/en/post/600123/
+
+
